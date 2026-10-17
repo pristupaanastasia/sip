@@ -1,0 +1,27 @@
+services:
+  server:
+    build: .
+    image: sip-case
+    command: ["server", "-listen", "0.0.0.0:5070", "-response", "/testdata/200ok.txt"]
+    ports:
+      - "5070:5070/udp"
+    volumes:
+      - ./testdata:/testdata:ro
+
+  proxy:
+    build: .
+    image: sip-case
+    command: ["proxy", "-listen", "0.0.0.0:5060", "-upstream", "server:5070", "-via-host", "proxy:5060"]
+    ports:
+      - "5060:5060/udp"
+    depends_on:
+      - server
+
+  client:
+    build: .
+    image: sip-case
+    command: ["client", "-proxy", "proxy:5060", "-request", "/testdata/invite.txt", "-timeout", "10s"]
+    volumes:
+      - ./testdata:/testdata:ro
+    depends_on:
+      - proxy
