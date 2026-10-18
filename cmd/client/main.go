@@ -23,6 +23,7 @@ var (
 	errNotRequest      = errors.New("file contains a response, expected a request")
 	errNoFinalResponse = errors.New("no final response received")
 	errFailureResponse = errors.New("request failed")
+	errMissingCallID   = errors.New("request has no Call-ID")
 )
 
 type config struct {
@@ -77,7 +78,10 @@ func run(cfg config, lg *logging.Logger) error {
 
 func sendRequest(conn *net.UDPConn, req *sip.Message, to *net.UDPAddr, timeout time.Duration, lg *logging.Logger) (*sip.Message, error) {
 	raw := req.Bytes()
-	callID, _ := req.Get("Call-ID")
+	callID, ok := req.Get("Call-ID")
+	if !ok {
+		return nil, errMissingCallID
+	}
 	deadline := time.Now().Add(timeout)
 
 	retransmitting := true

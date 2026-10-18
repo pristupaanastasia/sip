@@ -18,16 +18,19 @@ func NewSecret() []byte {
 	return secret
 }
 
-func Branch(secret []byte, req *sip.Message) string {
-	topVia, _ := req.Get("Via")
+func Branch(secret []byte, req *sip.Message) (string, error) {
+	topVia, viaOK := req.Get("Via")
+	callID, callIDOK := req.Get("Call-ID")
+	cseq, cseqOK := req.Get("CSeq")
+	if !viaOK || !callIDOK || !cseqOK {
+		return "", ErrMissingTransactionHeader
+	}
 	topVia, _, _ = strings.Cut(topVia, ",")
-	callID, _ := req.Get("Call-ID")
-	cseq, _ := req.Get("CSeq")
 
 	mac := hmac.New(sha256.New, secret)
 	for _, part := range []string{strings.TrimSpace(topVia), callID, cseq, req.RequestURI} {
 		mac.Write([]byte(part))
 		mac.Write([]byte{0})
 	}
-	return magicCookie + hex.EncodeToString(mac.Sum(nil)[:8])
+	return magicCookie + hex.EncodeToString(mac.Sum(nil)[:8]), nil
 }

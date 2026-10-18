@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -18,11 +17,15 @@ import (
 	"time"
 
 	"github.com/pristupaanastasia/sip/internal/logging"
+	"github.com/pristupaanastasia/sip/internal/proxy"
 	"github.com/pristupaanastasia/sip/internal/sip"
 	"github.com/pristupaanastasia/sip/internal/transport"
 )
 
-var errNotResponse = errors.New("file contains a request, expected a response")
+var (
+	errNotResponse         = errors.New("file contains a request, expected a response")
+	errMissingDialogHeader = errors.New("request has no Call-ID or From")
+)
 
 type config struct {
 	listenAddr   string
@@ -31,7 +34,7 @@ type config struct {
 }
 
 type app struct {
-	sender    transport.Sender
+	endpoint  transport.Endpoint
 	template  *sip.Message
 	delay     time.Duration
 	tagSecret []byte
@@ -73,10 +76,10 @@ func run(ctx context.Context, cfg config, lg *logging.Logger) error {
 	defer conn.Close()
 
 	a := &app{
-		sender:    transport.Sender{Conn: conn, Log: lg},
+		endpoint:  transport.Endpoint{Conn: conn, Log: lg},
 		template:  template,
 		delay:     cfg.delay,
-		tagSecret: newTagSecret(),
+		tagSecret: proxy.NewSecret(),
 		log:       lg,
 	}
 
@@ -87,22 +90,8 @@ func run(ctx context.Context, cfg config, lg *logging.Logger) error {
 }
 
 func (a *app) handle(data []byte, from *net.UDPAddr) {
-	msg, parseErr := sip.Parse(data)
-	if parseErr != nil {
-		a.log.Warn("drop unparsable message", slog.String("from", from.String()), slog.Any("err", parseErr))
-		var shortErr *sip.BodyTooShortError
-		if errors.As(parseErr, &shortErr) && shortErr.Message.ExpectsResponse() {
-			a.sender.Send(sip.NewResponse(shortErr.Message, 400, "Bad Request"), from)
-		}
-		return
-	}
-	a.log.Received(from, msg)
-
-	if validateErr := sip.Validate(msg); validateErr != nil {
-		a.log.Warn("drop invalid message", slog.String("from", from.String()), slog.Any("err", validateErr))
-		if msg.ExpectsResponse() {
-			a.sender.Send(sip.NewResponse(msg, 400, "Bad Request"), from)
-		}
+	msg, ok := a.endpoint.Receive(data, from)
+	if !ok {
 		return
 	}
 
@@ -110,12 +99,19 @@ func (a *app) handle(data []byte, from *net.UDPAddr) {
 		return
 	}
 
-	a.sender.Send(sip.NewTrying(msg), from)
+	final, finalErr := a.finalResponse(msg)
+	if finalErr != nil {
+		a.log.Warn("reject request", slog.String("from", from.String()), slog.Any("err", finalErr))
+		a.endpoint.Send(sip.NewResponse(msg, 400, "Bad Request"), from)
+		return
+	}
+
+	a.endpoint.Send(sip.NewTrying(msg), from)
 	time.Sleep(a.delay)
-	a.sender.Send(a.finalResponse(msg), from)
+	a.endpoint.Send(final, from)
 }
 
-func (a *app) finalResponse(req *sip.Message) *sip.Message {
+func (a *app) finalResponse(req *sip.Message) (*sip.Message, error) {
 	resp := sip.NewResponse(req, a.template.StatusCode, a.template.Reason)
 	for _, h := range a.template.Headers {
 		switch h.Name {
@@ -127,9 +123,13 @@ func (a *app) finalResponse(req *sip.Message) *sip.Message {
 	resp.Body = a.template.Body
 
 	if to, ok := resp.Get("To"); ok && !strings.Contains(to, ";tag=") {
-		resp.Set("To", to+";tag="+a.toTag(req))
+		tag, tagErr := a.toTag(req)
+		if tagErr != nil {
+			return nil, tagErr
+		}
+		resp.Set("To", to+";tag="+tag)
 	}
-	return resp
+	return resp, nil
 }
 
 func loadResponse(path string) (*sip.Message, error) {
@@ -147,19 +147,16 @@ func loadResponse(path string) (*sip.Message, error) {
 	return resp, nil
 }
 
-func (a *app) toTag(req *sip.Message) string {
-	callID, _ := req.Get("Call-ID")
-	from, _ := req.Get("From")
+func (a *app) toTag(req *sip.Message) (string, error) {
+	callID, callIDOK := req.Get("Call-ID")
+	from, fromOK := req.Get("From")
+	if !callIDOK || !fromOK {
+		return "", errMissingDialogHeader
+	}
 
 	mac := hmac.New(sha256.New, a.tagSecret)
 	mac.Write([]byte(callID))
 	mac.Write([]byte{0})
 	mac.Write([]byte(sip.Param(from, "tag")))
-	return hex.EncodeToString(mac.Sum(nil)[:8])
-}
-
-func newTagSecret() []byte {
-	secret := make([]byte, 32)
-	_, _ = rand.Read(secret)
-	return secret
+	return hex.EncodeToString(mac.Sum(nil)[:8]), nil
 }

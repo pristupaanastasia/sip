@@ -26,7 +26,7 @@ type config struct {
 }
 
 type app struct {
-	sender       transport.Sender
+	endpoint     transport.Endpoint
 	upstream     *net.UDPAddr
 	viaHost      string
 	branchSecret []byte
@@ -69,7 +69,7 @@ func run(ctx context.Context, cfg config, lg *logging.Logger) error {
 	defer conn.Close()
 
 	a := &app{
-		sender:       transport.Sender{Conn: conn, Log: lg},
+		endpoint:     transport.Endpoint{Conn: conn, Log: lg},
 		upstream:     upstream,
 		viaHost:      cfg.viaHost,
 		branchSecret: proxy.NewSecret(),
@@ -84,22 +84,8 @@ func run(ctx context.Context, cfg config, lg *logging.Logger) error {
 }
 
 func (a *app) handle(data []byte, from *net.UDPAddr) {
-	msg, parseErr := sip.Parse(data)
-	if parseErr != nil {
-		a.log.Warn("drop unparsable message", slog.String("from", from.String()), slog.Any("err", parseErr))
-		var shortErr *sip.BodyTooShortError
-		if errors.As(parseErr, &shortErr) && shortErr.Message.ExpectsResponse() {
-			a.sender.Send(sip.NewResponse(shortErr.Message, 400, "Bad Request"), from)
-		}
-		return
-	}
-	a.log.Received(from, msg)
-
-	if validateErr := sip.Validate(msg); validateErr != nil {
-		a.log.Warn("drop invalid message", slog.String("from", from.String()), slog.Any("err", validateErr))
-		if msg.ExpectsResponse() {
-			a.sender.Send(sip.NewResponse(msg, 400, "Bad Request"), from)
-		}
+	msg, ok := a.endpoint.Receive(data, from)
+	if !ok {
 		return
 	}
 
@@ -112,14 +98,18 @@ func (a *app) handle(data []byte, from *net.UDPAddr) {
 
 func (a *app) handleRequest(req *sip.Message, from *net.UDPAddr) {
 	if hopsErr := proxy.DecrementMaxForwards(req); hopsErr != nil {
-		a.log.Warn("reject request", slog.String("from", from.String()), slog.Any("err", hopsErr))
-		a.sender.Send(rejectResponse(req, hopsErr), from)
+		a.reject(req, from, hopsErr)
 		return
 	}
 
-	branch := proxy.Branch(a.branchSecret, req)
+	branch, branchErr := proxy.Branch(a.branchSecret, req)
+	if branchErr != nil {
+		a.reject(req, from, branchErr)
+		return
+	}
+
 	if req.ExpectsResponse() {
-		a.sender.Send(sip.NewTrying(req), from)
+		a.endpoint.Send(sip.NewTrying(req), from)
 		if !a.pending.Add(branch, from) {
 			a.log.Info("absorbed retransmission", slog.String("branch", branch))
 			return
@@ -127,7 +117,7 @@ func (a *app) handleRequest(req *sip.Message, from *net.UDPAddr) {
 	}
 
 	proxy.AddVia(req, a.viaHost, branch)
-	a.sender.Send(req, a.upstream)
+	a.endpoint.Send(req, a.upstream)
 }
 
 func (a *app) handleResponse(resp *sip.Message) {
@@ -150,11 +140,18 @@ func (a *app) handleResponse(resp *sip.Message) {
 	if resp.StatusCode >= 200 {
 		a.pending.Delete(branch)
 	}
-	a.sender.Send(resp, client)
+	a.endpoint.Send(resp, client)
 }
 
-func rejectResponse(req *sip.Message, hopsErr error) *sip.Message {
-	if errors.Is(hopsErr, proxy.ErrTooManyHops) {
+func (a *app) reject(req *sip.Message, from *net.UDPAddr, reason error) {
+	a.log.Warn("reject request", slog.String("from", from.String()), slog.Any("err", reason))
+	if req.ExpectsResponse() {
+		a.endpoint.Send(rejectResponse(req, reason), from)
+	}
+}
+
+func rejectResponse(req *sip.Message, reason error) *sip.Message {
+	if errors.Is(reason, proxy.ErrTooManyHops) {
 		return sip.NewResponse(req, 483, "Too Many Hops")
 	}
 	return sip.NewResponse(req, 400, "Bad Request")
