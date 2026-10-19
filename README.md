@@ -1,5 +1,7 @@
 # SIP over UDP: client, proxy, server
 
+![Expected components and exchanged messages](docs/figure1.png)
+
 ## Running
 
 With Docker:
